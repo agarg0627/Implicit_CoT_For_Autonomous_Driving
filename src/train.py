@@ -9,7 +9,7 @@ import random
 import torch
 
 from torch.utils.data import DataLoader
-from torch.optim import AdamW
+from transformers import AdamW
 
 from model import ImplicitModel
 from configuration_model import ImplicitModelConfig
@@ -22,61 +22,48 @@ torch.backends.cudnn.allow_tf32 = True
 logging.disable(logging.WARNING)
 
 
-def compute_lambda_distribution(removal_smoothing_lambda, truncate_length=100):
-    if removal_smoothing_lambda == float('inf'):
-        lambda_distribution = torch.zeros(truncate_length)
-        lambda_distribution[0] = 1
-    else:
-        positions = torch.arange(truncate_length)
-        lambda_distribution = (1 - math.exp(-removal_smoothing_lambda)) * positions.mul(-removal_smoothing_lambda).exp()
-        cum_prob = lambda_distribution.sum()
-        assert cum_prob <= 1
-        lambda_distribution[-1] = lambda_distribution[-1] + (1-cum_prob)
-    return lambda_distribution
+def get_punctuation_token_ids(tokenizer):
+    """Get token IDs for common punctuation marks."""
+    punctuation_chars = ['.', ',', ';', ':', '!', '?', '\n']
+    punctuation_tokens = set()
+    
+    for punct in punctuation_chars:
+        # Handle different tokenization patterns
+        tokens = tokenizer.encode(punct, add_special_tokens=False)
+        punctuation_tokens.update(tokens)
+        
+        # Also check with spaces (some tokenizers treat " ." differently than ".")
+        tokens_with_space = tokenizer.encode(f' {punct}', add_special_tokens=False)
+        punctuation_tokens.update(tokens_with_space)
+    
+    return punctuation_tokens
 
-def debug_print_removal(input_ids_all, tokenizer, removal_from_positions, removal_to_positions, 
-                       first_sep_positions, second_sep_positions, batch_id, to_remove, 
-                       removal_side, max_examples=3):
-    """Print debugging information about what tokens are being removed"""
-    if batch_id >= max_examples:  # Only print first few examples to avoid spam
-        return
-        
-    print(f"\n=== DEBUG: Batch {batch_id}, Removing {to_remove[batch_id].item()} sentences from {removal_side} ===")
-    
-    # Get the full reasoning section
-    reasoning_start = first_sep_positions[batch_id] + 1
-    reasoning_end = second_sep_positions[batch_id]
-    full_reasoning = input_ids_all[batch_id, reasoning_start:reasoning_end]
-    full_reasoning_text = tokenizer.decode(full_reasoning, skip_special_tokens=True)
-    
-    print(f"Full CoT reasoning: {full_reasoning_text}")
-    
-    # Get what's being removed
-    removal_from = removal_from_positions[batch_id]
-    removal_to = removal_to_positions[batch_id]
-    
-    if removal_from < removal_to:
-        removed_tokens = input_ids_all[batch_id, removal_from:removal_to]
-        removed_text = tokenizer.decode(removed_tokens, skip_special_tokens=True)
-        print(f"REMOVING ({removal_from.item()}-{removal_to.item()}): '{removed_text}'")
-        
-        # Show what remains
-        if removal_side == 'left':
-            remaining_tokens = input_ids_all[batch_id, removal_to:reasoning_end]
-            remaining_text = tokenizer.decode(remaining_tokens, skip_special_tokens=True)
-            print(f"REMAINING: '{remaining_text}'")
-        else:  # right
-            remaining_tokens = input_ids_all[batch_id, reasoning_start:removal_from]
-            remaining_text = tokenizer.decode(remaining_tokens, skip_special_tokens=True)
-            print(f"REMAINING: '{remaining_text}'")
+
+def find_punctuation_positions(input_ids, punctuation_token_ids, start_pos, end_pos):
+    """Find positions of punctuation marks within a range."""
+    positions = []
+    for i in range(start_pos, min(end_pos, len(input_ids))):
+        if input_ids[i].item() in punctuation_token_ids:
+            positions.append(i)
+    return positions
+
+
+def compute_chunks_to_remove_distribution(removal_smoothing_lambda, max_chunks=20):
+    """Compute distribution for number of chunks to remove."""
+    if removal_smoothing_lambda == float('inf'):
+        chunks_distribution = torch.zeros(max_chunks)
+        chunks_distribution[0] = 1
     else:
-        print("No tokens to remove (removal_from >= removal_to)")
-    
-    print("=" * 80)
+        positions = torch.arange(max_chunks)
+        chunks_distribution = (1 - math.exp(-removal_smoothing_lambda)) * positions.mul(-removal_smoothing_lambda).exp()
+        cum_prob = chunks_distribution.sum()
+        assert cum_prob <= 1
+        chunks_distribution[-1] = chunks_distribution[-1] + (1-cum_prob)
+    return chunks_distribution
 
     
 @torch.no_grad()
-def evaluate(dataloader, tokenizer, device, ctx, model, max_new_tokens, scheduled_to_remove, removal_side, removal_smoothing_lambda, lambda_distribution, keep_position=False, disable_random_removal_offset=False):
+def evaluate(dataloader, tokenizer, device, ctx, model, max_new_tokens, scheduled_chunks_to_remove, removal_side, removal_smoothing_lambda, chunks_distribution, punctuation_token_ids, keep_position=False, disable_random_removal_offset=False):
     model.eval()
     total_instances = 0
     total_tokens = 0
@@ -86,9 +73,7 @@ def evaluate(dataloader, tokenizer, device, ctx, model, max_new_tokens, schedule
     position_ids_all = None
     position_ids = None
     
-    print(f"\n=== EVALUATION: Scheduled to remove {scheduled_to_remove} sentences from {removal_side} ===")
-    
-    for batch_idx, batch in enumerate(tqdm.tqdm(dataloader)):
+    for batch in tqdm.tqdm(dataloader):
         input_ids_all = batch['input_ids_all'].to(device)
         labels = batch['labels_all'].to(device)
         # Remove answer part
@@ -99,82 +84,72 @@ def evaluate(dataloader, tokenizer, device, ctx, model, max_new_tokens, schedule
         second_sep_positions = get_sep_position(input_ids_all, tokenizer.eos_token_id, skip=1)
         eos_positions = get_sep_position(input_ids_all, tokenizer.eos_token_id, skip=2)
 
-        if scheduled_to_remove > 0 or removal_smoothing_lambda != float('inf'):
+        if scheduled_chunks_to_remove > 0 or removal_smoothing_lambda != float('inf'):
             if keep_position:
                 position_ids_all = torch.arange(0, input_ids_all.shape[-1], dtype=torch.long, device=device).unsqueeze(0).repeat(batch_size, 1)
+            
             input_ids_all_tmp = []
             labels_tmp = []
-            random_removal_offset = torch.multinomial(lambda_distribution, batch_size, replacement=True).to(device)
+            random_removal_offset = torch.multinomial(chunks_distribution, batch_size, replacement=True).to(device)
             if disable_random_removal_offset:
                 random_removal_offset.fill_(0)
-            to_remove = scheduled_to_remove + random_removal_offset
-            
-            # Get token IDs for multiple punctuation marks
-            punctuation_marks = ['.', ',', '!', '?', ';', ':']
-            punctuation_token_ids = []
-            for mark in punctuation_marks:
-                try:
-                    token_id = tokenizer.encode(mark)[0]
-                    punctuation_token_ids.append(token_id)
-                except:
-                    # Skip if tokenizer doesn't have this punctuation
-                    pass
-            punctuation_token_ids = torch.tensor(punctuation_token_ids, device=device)
-            if removal_side == 'left':
-                removal_from_positions = first_sep_positions + 1 # remove from, including
-                # Find next punctuation position for each batch item
-                removal_to_positions = torch.zeros_like(first_sep_positions)
-                for i in range(input_ids_all.shape[0]):
-                    if to_remove[i] > 0:
-                        # Find positions of any punctuation mark
-                        reasoning_section = input_ids_all[i, first_sep_positions[i]+1:second_sep_positions[i]]
-                        punctuation_positions = []
-                        for pos, token in enumerate(reasoning_section):
-                            if token in punctuation_token_ids:
-                                punctuation_positions.append(pos)
-                        
-                        if len(punctuation_positions) >= to_remove[i]:
-                            removal_to_positions[i] = first_sep_positions[i] + 1 + punctuation_positions[to_remove[i]-1] + 1
-                        else:
-                            removal_to_positions[i] = second_sep_positions[i]  # Remove all if not enough punctuation
-                    else:
-                        removal_to_positions[i] = first_sep_positions[i] + 1  # Remove nothing (from=to)
-            else: # removal_side == 'right'
-                removal_to_positions = second_sep_positions
-                # Find punctuation positions from right side
-                removal_from_positions = torch.zeros_like(second_sep_positions)
-                for i in range(input_ids_all.shape[0]):
-                    if to_remove[i] > 0:
-                        # Find positions of any punctuation mark
-                        reasoning_section = input_ids_all[i, first_sep_positions[i]+1:second_sep_positions[i]]
-                        punctuation_positions = []
-                        for pos, token in enumerate(reasoning_section):
-                            if token in punctuation_token_ids:
-                                punctuation_positions.append(pos)
-                        
-                        if len(punctuation_positions) >= to_remove[i]:
-                            removal_from_positions[i] = first_sep_positions[i] + 1 + punctuation_positions[-(to_remove[i])]
-                        else:
-                            removal_from_positions[i] = first_sep_positions[i] + 1  # Remove all if not enough punctuation
-                    else:
-                        removal_from_positions[i] = second_sep_positions[i]  # Remove nothing (from=to)
-
-            # DEBUG: Print removal information for first batch
-            if batch_idx == 0:
-                for batch_id in range(min(3, input_ids_all.shape[0])):
-                    debug_print_removal(input_ids_all, tokenizer, removal_from_positions, removal_to_positions,
-                                      first_sep_positions, second_sep_positions, batch_id, to_remove, removal_side)
+            chunks_to_remove = scheduled_chunks_to_remove + random_removal_offset
 
             for batch_id in range(input_ids_all.shape[0]):
                 eos_position = eos_positions[batch_id]
-                removal_from_position = removal_from_positions[batch_id]
-                removal_to_position = removal_to_positions[batch_id]
-                removal_from_position = max(removal_from_position, first_sep_positions[batch_id]+1)
-                removal_to_position = min(removal_to_position, second_sep_positions[batch_id])
+                first_sep_pos = first_sep_positions[batch_id]
+                second_sep_pos = second_sep_positions[batch_id]
+                chunks_to_remove_this = chunks_to_remove[batch_id].item()
+                
+                # Find punctuation positions in the reasoning section
+                reasoning_start = first_sep_pos + 1
+                reasoning_end = second_sep_pos
+                punct_positions = find_punctuation_positions(
+                    input_ids_all[batch_id], punctuation_token_ids, 
+                    reasoning_start, reasoning_end
+                )
+                
+                if len(punct_positions) == 0 or chunks_to_remove_this == 0:
+                    # No punctuation found or nothing to remove
+                    input_ids_all_tmp.append(input_ids_all[batch_id, :eos_position+1])
+                    labels_tmp.append(labels[batch_id, :eos_position+1])
+                    continue
+                
+                # Determine removal boundaries based on punctuation
+                if removal_side == 'left':
+                    # Remove from beginning up to Nth punctuation mark
+                    chunks_to_remove_actual = min(chunks_to_remove_this, len(punct_positions))
+                    if chunks_to_remove_actual > 0:
+                        removal_from_position = reasoning_start
+                        removal_to_position = punct_positions[chunks_to_remove_actual - 1] + 1  # include punctuation
+                    else:
+                        removal_from_position = removal_to_position = reasoning_start
+                else:  # removal_side == 'right'
+                    # Remove from Nth-to-last punctuation mark to end
+                    chunks_to_remove_actual = min(chunks_to_remove_this, len(punct_positions))
+                    if chunks_to_remove_actual > 0:
+                        removal_from_position = punct_positions[-(chunks_to_remove_actual)] if chunks_to_remove_actual <= len(punct_positions) else reasoning_start
+                        removal_to_position = reasoning_end
+                    else:
+                        removal_from_position = removal_to_position = reasoning_end
+                
+                # Ensure boundaries are within reasoning section
+                removal_from_position = max(removal_from_position, reasoning_start)
+                removal_to_position = min(removal_to_position, reasoning_end)
+                
                 if keep_position:
-                    position_ids_all[batch_id, removal_from_position-1:] += removal_to_position-removal_from_position
-                input_ids_all_tmp.append(torch.cat((input_ids_all[batch_id, :removal_from_position], input_ids_all[batch_id, removal_to_position:eos_position+1]), dim=-1))
-                labels_tmp.append(torch.cat((labels[batch_id, :removal_from_position], labels[batch_id, removal_to_position:eos_position+1]), dim=-1))
+                    position_ids_all[batch_id, removal_from_position-1:] += removal_to_position - removal_from_position
+                
+                # Create new sequence without removed tokens
+                input_ids_all_tmp.append(torch.cat((
+                    input_ids_all[batch_id, :removal_from_position], 
+                    input_ids_all[batch_id, removal_to_position:eos_position+1]
+                ), dim=-1))
+                labels_tmp.append(torch.cat((
+                    labels[batch_id, :removal_from_position], 
+                    labels[batch_id, removal_to_position:eos_position+1]
+                ), dim=-1))
+            
             input_ids_all = batch_ids(input_ids_all_tmp, tokenizer.eos_token_id, device, input_ids_all.dtype)
             labels = batch_ids(labels_tmp, -100, device, input_ids.dtype)
 
@@ -213,6 +188,7 @@ def evaluate(dataloader, tokenizer, device, ctx, model, max_new_tokens, schedule
             print (f'Target: {tgt_text}')
             print (f'Predicted: {pred_text}')
             print ('')
+    
     accuracy = total_correct / total_instances
     token_accuracy = total_correct_tokens / total_tokens
     loss = total_loss / total_tokens
@@ -230,7 +206,7 @@ def main():
     parser.add_argument('--lr', type=float, default=5e-5)
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--accumulate', type=int, default=1)
-    parser.add_argument('--remove_per_epoch', type=float, default=8)
+    parser.add_argument('--remove_per_epoch', type=float, default=2)  # Now chunks per epoch, not tokens
     parser.add_argument('--remove_all_when_remove_beyond', type=str, default='inf')
     parser.add_argument('--removal_smoothing_lambda', type=float, default=float('inf'))
     parser.add_argument('--removal_side', type=str, choices=['left', 'right'], default='left')
@@ -258,11 +234,12 @@ def main():
         args.remove_all_when_remove_beyond = float('inf')
     else:
         args.remove_all_when_remove_beyond = int(args.remove_all_when_remove_beyond)
-    print (args)
+    
+    print(args)
     random.seed(args.seed)
     torch.manual_seed(args.seed)
-    lambda_distribution = compute_lambda_distribution(args.removal_smoothing_lambda)
-    print (lambda_distribution.tolist()[:10])
+    chunks_distribution = compute_chunks_to_remove_distribution(args.removal_smoothing_lambda)
+    print("Chunks distribution:", chunks_distribution.tolist()[:10])
 
     dtype = 'float32'
     if args.bf16:
@@ -270,20 +247,20 @@ def main():
     ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     ctx = torch.amp.autocast(device_type='cuda', dtype=ptdtype)
-    print (ptdtype, dtype, device)
+    print(ptdtype, dtype, device)
 
     # Create model
     if args.from_pretrained is None:
         config = ImplicitModelConfig(base_model=args.model)
         model = ImplicitModel(config).to(device).to(ptdtype)
     else:
-        print (f'Loading from {args.from_pretrained}')
+        print(f'Loading from {args.from_pretrained}')
         model = ImplicitModel.from_pretrained(args.from_pretrained).to(device).to(ptdtype)
+    
     if 'gpt2' in args.model:
         old_length = model.base_model.transformer.wpe.weight.shape[0]
         if args.truncation > old_length and args.from_pretrained is None:
-            #import pdb; pdb.set_trace()
-            print ('EXPANDING POSITIONs')
+            print('EXPANDING POSITIONs')
             new_wpe = torch.nn.Embedding(args.truncation, model.base_model.transformer.wpe.weight.shape[-1])
             new_wpe.weight.data[:old_length] = model.base_model.transformer.wpe.weight
             new_wpe.weight.data[old_length:] = model.base_model.transformer.wpe.weight[-1].view(1, -1).expand(args.truncation-old_length, -1)
@@ -297,15 +274,20 @@ def main():
                 ),
                 persistent=False,
             )
+    
     model = model.to(device).to(ptdtype)
     tokenizer = model.tokenizer
 
+    # Get punctuation token IDs
+    punctuation_token_ids = get_punctuation_token_ids(tokenizer)
+    print(f"Punctuation token IDs: {punctuation_token_ids}")
+
     if args.reinitialize_weights:
-        print ('reinitializing weights')
+        print('reinitializing weights')
         model.base_model.apply(model.base_model._init_weights)
 
     if args.keep_position:
-        assert 'gpt2' in args.model # only implemented for gpt2 generate TODO: the code for this is not checked in yet
+        assert 'gpt2' in args.model  # only implemented for gpt2 generate
 
     # Load data
     collate_fn = CoTDataCollator(tokenizer)
@@ -325,43 +307,44 @@ def main():
 
     # Train
     step = 0
-    scheduled_to_remove = 0
+    scheduled_chunks_to_remove = 0
     if args.remove_start_from > 0:
-        print (f'the number of removed CoT tokens starts from {args.remove_start_from}')
-        scheduled_to_remove = args.remove_start_from
+        print(f'the number of removed CoT chunks starts from {args.remove_start_from}')
+        scheduled_chunks_to_remove = args.remove_start_from
 
     position_ids = None
 
     steps_per_epoch = len(train_dataloader)
-    steps_per_removed_token = int(round(steps_per_epoch / args.remove_per_epoch))
+    steps_per_removed_chunk = int(round(steps_per_epoch / args.remove_per_epoch))
     remove_step_counter = 0
     best_val_accuracy = float('-inf')
 
     all_cot_removed_in_prev_batch = False
     for epoch in range(args.epochs):
-        if scheduled_to_remove < float('inf'):
-            scheduled_to_remove = int(round(scheduled_to_remove))
-        if scheduled_to_remove >= args.remove_all_when_remove_beyond:
-            scheduled_to_remove = float('inf') # remove all
-        print(f"Epoch {epoch}. Scheduled to remove: {scheduled_to_remove}")
+        if scheduled_chunks_to_remove < float('inf'):
+            scheduled_chunks_to_remove = int(round(scheduled_chunks_to_remove))
+        if scheduled_chunks_to_remove >= args.remove_all_when_remove_beyond:
+            scheduled_chunks_to_remove = float('inf')  # remove all
+        print(f"Epoch {epoch}. Scheduled chunks to remove: {scheduled_chunks_to_remove}")
         model.train()
         
-        for batch_idx, batch in enumerate(tqdm.tqdm(train_dataloader)):
-            prev_scheduled_to_remove = scheduled_to_remove
-            if remove_step_counter == steps_per_removed_token or steps_per_removed_token == 0:
-                scheduled_to_remove += 1
+        for batch in tqdm.tqdm(train_dataloader):
+            prev_scheduled_chunks_to_remove = scheduled_chunks_to_remove
+            if remove_step_counter == steps_per_removed_chunk or steps_per_removed_chunk == 0:
+                scheduled_chunks_to_remove += 1
                 remove_step_counter = 0
             if epoch >= args.pretrain_epochs:
                 remove_step_counter += 1
-            if scheduled_to_remove > prev_scheduled_to_remove:
-                print(f" -epoch {epoch}. step {step}. removing: {scheduled_to_remove}")
+            if scheduled_chunks_to_remove > prev_scheduled_chunks_to_remove:
+                print(f" -epoch {epoch}. step {step}. removing chunks: {scheduled_chunks_to_remove}")
                 if args.reset_optimizer and (not all_cot_removed_in_prev_batch):
-                    print ('RESETTING OPTIMIZER')
+                    print('RESETTING OPTIMIZER')
                     optimizer.zero_grad(set_to_none=True)
                     del optimizer
                     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, **extra_args)
-            if scheduled_to_remove >= args.remove_all_when_remove_beyond:
-                scheduled_to_remove = float('inf') # remove all
+            if scheduled_chunks_to_remove >= args.remove_all_when_remove_beyond:
+                scheduled_chunks_to_remove = float('inf')  # remove all
+            
             input_ids = batch['input_ids_all'].to(device)
             labels = batch['labels_all'].to(device)
             batch_size = input_ids.shape[0]
@@ -371,92 +354,86 @@ def main():
             eos_positions = get_sep_position(input_ids, tokenizer.eos_token_id, skip=2)
 
             all_cot_removed_in_batch = False
-            if scheduled_to_remove > 0 or args.removal_smoothing_lambda != float('inf'):
+            if scheduled_chunks_to_remove > 0 or args.removal_smoothing_lambda != float('inf'):
                 input_ids_tmp = []
                 labels_tmp = []
-                random_removal_offset = torch.multinomial(lambda_distribution, batch_size, replacement=True).to(device)
-                to_remove = scheduled_to_remove + random_removal_offset
+                random_removal_offset = torch.multinomial(chunks_distribution, batch_size, replacement=True).to(device)
+                chunks_to_remove = scheduled_chunks_to_remove + random_removal_offset
                 if epoch < args.pretrain_epochs:
-                    to_remove.fill_(args.remove_start_from)
+                    chunks_to_remove.fill_(args.remove_start_from)
+                
                 if args.keep_position:
                     position_ids = torch.arange(0, input_ids.shape[-1], dtype=torch.long, device=device).unsqueeze(0).repeat(batch_size, 1)
-                
-                # Get token IDs for multiple punctuation marks
-                punctuation_marks = ['.', ',', '!', '?', ';', ':']
-                punctuation_token_ids = []
-                for mark in punctuation_marks:
-                    try:
-                        token_id = tokenizer.encode(mark)[0]
-                        punctuation_token_ids.append(token_id)
-                    except:
-                        # Skip if tokenizer doesn't have this punctuation
-                        pass
-                punctuation_token_ids = torch.tensor(punctuation_token_ids, device=device)
-                if args.removal_side == 'left':
-                    removal_from_positions = first_sep_positions + 1 # remove from, including
-                    removal_to_positions = torch.zeros_like(first_sep_positions)
-                    for i in range(input_ids.shape[0]):
-                        if to_remove[i] > 0:
-                            # Find positions of any punctuation mark
-                            reasoning_section = input_ids[i, first_sep_positions[i]+1:second_sep_positions[i]]
-                            punctuation_positions = []
-                            for pos, token in enumerate(reasoning_section):
-                                if token in punctuation_token_ids:
-                                    punctuation_positions.append(pos)
-                            
-                            if len(punctuation_positions) >= to_remove[i]:
-                                removal_to_positions[i] = first_sep_positions[i] + 1 + punctuation_positions[to_remove[i]-1] + 1
-                            else:
-                                removal_to_positions[i] = second_sep_positions[i]  # Remove all if not enough punctuation
-                        else:
-                            removal_to_positions[i] = first_sep_positions[i] + 1  # Remove nothing (from=to)
-                else: # removal_side == 'right'
-                    removal_to_positions = second_sep_positions
-                    removal_from_positions = torch.zeros_like(second_sep_positions)
-                    for i in range(input_ids.shape[0]):
-                        if to_remove[i] > 0:
-                            # Find positions of any punctuation mark
-                            reasoning_section = input_ids[i, first_sep_positions[i]+1:second_sep_positions[i]]
-                            punctuation_positions = []
-                            for pos, token in enumerate(reasoning_section):
-                                if token in punctuation_token_ids:
-                                    punctuation_positions.append(pos)
-                            
-                            if len(punctuation_positions) >= to_remove[i]:
-                                removal_from_positions[i] = first_sep_positions[i] + 1 + punctuation_positions[-(to_remove[i])]
-                            else:
-                                removal_from_positions[i] = first_sep_positions[i] + 1  # Remove all if not enough punctuation
-                        else:
-                            removal_from_positions[i] = second_sep_positions[i]  # Remove nothing (from=to)
-
-                # DEBUG: Print removal information for first few batches of first epoch
-                if epoch == 0 and batch_idx < 5 and (scheduled_to_remove > 0 or args.removal_smoothing_lambda != float('inf')):
-                    print(f"\n=== TRAINING DEBUG: Epoch {epoch}, Batch {batch_idx} ===")
-                    for batch_id in range(min(2, input_ids.shape[0])):
-                        debug_print_removal(input_ids, tokenizer, removal_from_positions, removal_to_positions,
-                                          first_sep_positions, second_sep_positions, batch_id, to_remove, args.removal_side)
 
                 all_cot_removed_in_batch = True
                 for batch_id in range(input_ids.shape[0]):
                     eos_position = eos_positions[batch_id]
-                    removal_from_position = removal_from_positions[batch_id]
-                    removal_to_position = removal_to_positions[batch_id]
-                    removal_from_position = max(removal_from_position, first_sep_positions[batch_id]+1)
-                    if removal_to_position < second_sep_positions[batch_id]:
+                    first_sep_pos = first_sep_positions[batch_id]
+                    second_sep_pos = second_sep_positions[batch_id]
+                    chunks_to_remove_this = chunks_to_remove[batch_id].item()
+                    
+                    # Find punctuation positions in the reasoning section
+                    reasoning_start = first_sep_pos + 1
+                    reasoning_end = second_sep_pos
+                    punct_positions = find_punctuation_positions(
+                        input_ids[batch_id], punctuation_token_ids, 
+                        reasoning_start, reasoning_end
+                    )
+                    
+                    if len(punct_positions) == 0 or chunks_to_remove_this == 0:
+                        # No punctuation found or nothing to remove
+                        input_ids_tmp.append(input_ids[batch_id, :eos_position+1])
+                        labels_tmp.append(labels[batch_id, :eos_position+1])
                         all_cot_removed_in_batch = False
-                    removal_to_position = min(removal_to_position, second_sep_positions[batch_id])
+                        continue
+                    
+                    # Determine removal boundaries based on punctuation
+                    if args.removal_side == 'left':
+                        # Remove from beginning up to Nth punctuation mark
+                        chunks_to_remove_actual = min(chunks_to_remove_this, len(punct_positions))
+                        if chunks_to_remove_actual > 0:
+                            removal_from_position = reasoning_start
+                            removal_to_position = punct_positions[chunks_to_remove_actual - 1] + 1  # include punctuation
+                        else:
+                            removal_from_position = removal_to_position = reasoning_start
+                    else:  # removal_side == 'right'
+                        # Remove from Nth-to-last punctuation mark to end
+                        chunks_to_remove_actual = min(chunks_to_remove_this, len(punct_positions))
+                        if chunks_to_remove_actual > 0:
+                            removal_from_position = punct_positions[-(chunks_to_remove_actual)] if chunks_to_remove_actual <= len(punct_positions) else reasoning_start
+                            removal_to_position = reasoning_end
+                        else:
+                            removal_from_position = removal_to_position = reasoning_end
+                    
+                    # Check if we're removing everything
+                    if removal_to_position < reasoning_end:
+                        all_cot_removed_in_batch = False
+                    
+                    # Ensure boundaries are within reasoning section
+                    removal_from_position = max(removal_from_position, reasoning_start)
+                    removal_to_position = min(removal_to_position, reasoning_end)
+                    
                     if args.keep_position:
-                        position_ids[batch_id, removal_from_position-1:] += removal_to_position-removal_from_position
-                    input_ids_tmp.append(torch.cat((input_ids[batch_id, :removal_from_position], input_ids[batch_id, removal_to_position:eos_position+1]), dim=-1))
-                    labels_tmp.append(torch.cat((labels[batch_id, :removal_from_position], labels[batch_id, removal_to_position:eos_position+1]), dim=-1))
+                        position_ids[batch_id, removal_from_position-1:] += removal_to_position - removal_from_position
+                    
+                    # Create new sequence without removed tokens
+                    input_ids_tmp.append(torch.cat((
+                        input_ids[batch_id, :removal_from_position], 
+                        input_ids[batch_id, removal_to_position:eos_position+1]
+                    ), dim=-1))
+                    labels_tmp.append(torch.cat((
+                        labels[batch_id, :removal_from_position], 
+                        labels[batch_id, removal_to_position:eos_position+1]
+                    ), dim=-1))
+                
                 input_ids = batch_ids(input_ids_tmp, tokenizer.eos_token_id, device, input_ids.dtype)
                 labels = batch_ids(labels_tmp, -100, device, input_ids.dtype)
                 if not all_cot_removed_in_batch:
                     best_val_accuracy = float('-inf')
-            #print (input_ids.shape)
+            
             all_cot_removed_in_prev_batch = all_cot_removed_in_batch
             if args.max_len_train > 0 and input_ids.shape[-1] > args.max_len_train:
-                print ('skipped')
+                print('skipped')
                 continue
            
             with ctx:
@@ -473,19 +450,31 @@ def main():
             if step % 100 == 0:
                 token_accuracy = outputs.token_accuracy.item()
                 ppl = loss.exp().item()
-                print (f"Step: {step}. PPL: {ppl}. Token Accuracy: {token_accuracy}")
+                print(f"Step: {step}. PPL: {ppl}. Token Accuracy: {token_accuracy}")
             step += 1
-        print (f'Scheduled to remove: {scheduled_to_remove}')
-        accuracy, token_accuracy, ppl = evaluate(val_dataloader, tokenizer, device, ctx, model, args.max_new_tokens, scheduled_to_remove, args.removal_side, args.removal_smoothing_lambda, lambda_distribution, keep_position=args.keep_position, disable_random_removal_offset=True)
-        print (f'Disable Offset Val. PPL: {ppl}; Accuracy: {accuracy}; Token Accuracy: {token_accuracy}.')
+        
+        print(f'Scheduled chunks to remove: {scheduled_chunks_to_remove}')
+        accuracy, token_accuracy, ppl = evaluate(
+            val_dataloader, tokenizer, device, ctx, model, args.max_new_tokens, 
+            scheduled_chunks_to_remove, args.removal_side, args.removal_smoothing_lambda, 
+            chunks_distribution, punctuation_token_ids, keep_position=args.keep_position, 
+            disable_random_removal_offset=True
+        )
+        print(f'Disable Offset Val. PPL: {ppl}; Accuracy: {accuracy}; Token Accuracy: {token_accuracy}.')
+        
         if accuracy > best_val_accuracy:
-            print ('***best so far or removed more CoT tokens***')
+            print('***best so far or removed more CoT chunks***')
             best_val_accuracy = accuracy
             if args.test_path:
-                accuracy, token_accuracy, ppl = evaluate(test_dataloader, tokenizer, device, ctx, model, args.max_new_tokens, scheduled_to_remove, args.removal_side, args.removal_smoothing_lambda, lambda_distribution, keep_position=args.keep_position, disable_random_removal_offset=True)
-                print (f'Test. PPL: {ppl}; Accuracy: {accuracy}; Token Accuracy: {token_accuracy}.')
-        if (epoch + 1) % 5 == 0:
-            model.save_pretrained(os.path.join(args.save_model, f'checkpoint_{epoch + 1}'))
+                accuracy, token_accuracy, ppl = evaluate(
+                    test_dataloader, tokenizer, device, ctx, model, args.max_new_tokens,
+                    scheduled_chunks_to_remove, args.removal_side, args.removal_smoothing_lambda,
+                    chunks_distribution, punctuation_token_ids, keep_position=args.keep_position,
+                    disable_random_removal_offset=True
+                )
+                print(f'Test. PPL: {ppl}; Accuracy: {accuracy}; Token Accuracy: {token_accuracy}.')
+        
+        model.save_pretrained(os.path.join(args.save_model, f'checkpoint_{epoch}'))
 
 if __name__ == "__main__":
     main()
