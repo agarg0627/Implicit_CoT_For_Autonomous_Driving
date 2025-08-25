@@ -39,6 +39,109 @@ def get_punctuation_token_ids(tokenizer):
     return punctuation_tokens
 
 
+def chunk_text(text, punctuation_chars=['.', ',', ';', ':', '!', '?']):
+    """Chunks text using punctuation."""
+    chunks = []
+    current_start = 0
+    
+    for i, char in enumerate(text):
+        if char in punctuation_chars:
+            # Include the punctuation in the chunk
+            chunk_text = text[current_start:i+1]
+            if chunk_text.strip():  # Only add non-empty chunks
+                chunks.append(chunk_text)
+            current_start = i + 1
+    
+    # Handle remaining text (if no punctuation at end)
+    if current_start < len(text):
+        remaining = text[current_start:]
+        if remaining.strip():
+            chunks.append(remaining)
+    
+    return chunks
+
+
+def remove_chunks(input_ids, labels, tokenizer, first_sep_pos, second_sep_pos, 
+                                     eos_position, chunks_to_remove, removal_side, 
+                                     punctuation_chars=['.', ',', ';', ':', '!', '?']):
+    """Remove chunks from text."""
+    
+    # Step 1: Extract reasoning section tokens
+    reasoning_tokens = input_ids[first_sep_pos + 1:second_sep_pos]
+    
+    if len(reasoning_tokens) == 0:
+        return input_ids[:eos_position+1], labels[:eos_position+1]
+    
+    # Step 2: Decode to text
+    reasoning_text = tokenizer.decode(reasoning_tokens, skip_special_tokens=True)
+    
+    # Step 3: Chunk the text
+    chunks = chunk_text(reasoning_text, punctuation_chars)
+    
+    if len(chunks) == 0 or chunks_to_remove == 0:
+        return input_ids[:eos_position+1], labels[:eos_position+1]
+    
+    # Step 4: Determine which chunks to keep
+    if removal_side == 'left':
+        chunks_to_remove_actual = min(chunks_to_remove, len(chunks))
+        if chunks_to_remove_actual > 0:
+            # Keep chunks after the removed ones
+            chunks_to_keep = chunks[chunks_to_remove_actual:]
+        else:
+            chunks_to_keep = chunks
+    else:  # 'right'
+        chunks_to_remove_actual = min(chunks_to_remove, len(chunks))
+        if chunks_to_remove_actual > 0:
+            # Keep chunks before the removed ones
+            chunks_to_keep = chunks[:-chunks_to_remove_actual]
+        else:
+            chunks_to_keep = chunks
+    
+    # Step 5: Reconstruct the reasoning text
+    if chunks_to_keep:
+        # Join chunks with appropriate spacing
+        reconstructed_chunks = []
+        for i, chunk in enumerate(chunks_to_keep):
+            if i > 0:
+                # Add space between chunks if the previous chunk doesn't end with space
+                # and current chunk doesn't start with space
+                prev_chunk = reconstructed_chunks[-1] if reconstructed_chunks else ""
+                if prev_chunk and not prev_chunk.endswith(' ') and not chunk.startswith(' '):
+                    reconstructed_chunks.append(' ')
+            reconstructed_chunks.append(chunk)
+        new_reasoning_text = ''.join(reconstructed_chunks)
+    else:
+        new_reasoning_text = ""
+    
+    # Step 6: Re-tokenize the new reasoning
+    if new_reasoning_text.strip():
+        new_reasoning_tokens = tokenizer.encode(new_reasoning_text, add_special_tokens=False)
+        new_reasoning_tensor = torch.tensor(new_reasoning_tokens, device=input_ids.device, dtype=input_ids.dtype)
+    else:
+        new_reasoning_tensor = torch.tensor([], device=input_ids.device, dtype=input_ids.dtype)
+    
+    # Step 7: Reconstruct full sequence
+    new_input_ids = torch.cat([
+        input_ids[:first_sep_pos + 1],  # Question + first separator
+        new_reasoning_tensor,           # Modified reasoning
+        input_ids[second_sep_pos:eos_position+1]  # Second separator + answer + end
+    ])
+    
+    # Handle labels similarly
+    if len(new_reasoning_tensor) > 0:
+        reasoning_labels = torch.full((len(new_reasoning_tensor),), -100, device=labels.device, dtype=labels.dtype)
+    else:
+        reasoning_labels = torch.tensor([], device=labels.device, dtype=labels.dtype)
+    
+    new_labels = torch.cat([
+        labels[:first_sep_pos + 1],
+        reasoning_labels,
+        labels[second_sep_pos:eos_position+1]
+    ])
+    
+    return new_input_ids, new_labels
+
+
 def find_punctuation_positions(input_ids, punctuation_token_ids, start_pos, end_pos):
     """Find positions of punctuation marks within a range."""
     positions = []
@@ -85,9 +188,6 @@ def evaluate(dataloader, tokenizer, device, ctx, model, max_new_tokens, schedule
         eos_positions = get_sep_position(input_ids_all, tokenizer.eos_token_id, skip=2)
 
         if scheduled_chunks_to_remove > 0 or removal_smoothing_lambda != float('inf'):
-            if keep_position:
-                position_ids_all = torch.arange(0, input_ids_all.shape[-1], dtype=torch.long, device=device).unsqueeze(0).repeat(batch_size, 1)
-            
             input_ids_all_tmp = []
             labels_tmp = []
             random_removal_offset = torch.multinomial(chunks_distribution, batch_size, replacement=True).to(device)
@@ -101,60 +201,22 @@ def evaluate(dataloader, tokenizer, device, ctx, model, max_new_tokens, schedule
                 second_sep_pos = second_sep_positions[batch_id]
                 chunks_to_remove_this = chunks_to_remove[batch_id].item()
                 
-                # Find punctuation positions in the reasoning section
-                reasoning_start = first_sep_pos + 1
-                reasoning_end = second_sep_pos
-                punct_positions = find_punctuation_positions(
-                    input_ids_all[batch_id], punctuation_token_ids, 
-                    reasoning_start, reasoning_end
+                # Use text-level chunking
+                new_input_ids, new_labels = remove_chunks(
+                    input_ids_all[batch_id], labels[batch_id], tokenizer,
+                    first_sep_pos, second_sep_pos, eos_position,
+                    chunks_to_remove_this, removal_side
                 )
                 
-                if len(punct_positions) == 0 or chunks_to_remove_this == 0:
-                    # No punctuation found or nothing to remove
-                    input_ids_all_tmp.append(input_ids_all[batch_id, :eos_position+1])
-                    labels_tmp.append(labels[batch_id, :eos_position+1])
-                    continue
-                
-                # Determine removal boundaries based on punctuation
-                if removal_side == 'left':
-                    # Remove from beginning up to Nth punctuation mark
-                    chunks_to_remove_actual = min(chunks_to_remove_this, len(punct_positions))
-                    if chunks_to_remove_actual > 0:
-                        removal_from_position = reasoning_start
-                        removal_to_position = punct_positions[chunks_to_remove_actual - 1] + 1  # include punctuation
-                    else:
-                        removal_from_position = removal_to_position = reasoning_start
-                else:  # removal_side == 'right'
-                    # Remove from Nth-to-last punctuation mark to end
-                    chunks_to_remove_actual = min(chunks_to_remove_this, len(punct_positions))
-                    if chunks_to_remove_actual > 0:
-                        removal_from_position = punct_positions[-(chunks_to_remove_actual)] if chunks_to_remove_actual <= len(punct_positions) else reasoning_start
-                        removal_to_position = reasoning_end
-                    else:
-                        removal_from_position = removal_to_position = reasoning_end
-                
-                # Ensure boundaries are within reasoning section
-                removal_from_position = max(removal_from_position, reasoning_start)
-                removal_to_position = min(removal_to_position, reasoning_end)
-                
-                if keep_position:
-                    position_ids_all[batch_id, removal_from_position-1:] += removal_to_position - removal_from_position
-                
-                # Create new sequence without removed tokens
-                input_ids_all_tmp.append(torch.cat((
-                    input_ids_all[batch_id, :removal_from_position], 
-                    input_ids_all[batch_id, removal_to_position:eos_position+1]
-                ), dim=-1))
-                labels_tmp.append(torch.cat((
-                    labels[batch_id, :removal_from_position], 
-                    labels[batch_id, removal_to_position:eos_position+1]
-                ), dim=-1))
+                input_ids_all_tmp.append(new_input_ids)
+                labels_tmp.append(new_labels)
             
             input_ids_all = batch_ids(input_ids_all_tmp, tokenizer.eos_token_id, device, input_ids_all.dtype)
             labels = batch_ids(labels_tmp, -100, device, input_ids.dtype)
 
         with ctx:
             if keep_position:
+                position_ids_all = torch.arange(0, input_ids_all.shape[-1], dtype=torch.long, device=device).unsqueeze(0).repeat(batch_size, 1)
                 position_ids_all = position_ids_all[:, :input_ids_all.shape[-1]]
             outputs = model.compute_loss(input_ids=input_ids_all, labels=labels, position_ids=position_ids_all)
 
@@ -327,8 +389,10 @@ def main():
             scheduled_chunks_to_remove = float('inf')  # remove all
         print(f"Epoch {epoch}. Scheduled chunks to remove: {scheduled_chunks_to_remove}")
         model.train()
-        
+
+        batch_counter = 0
         for batch in tqdm.tqdm(train_dataloader):
+            batch_counter += 1
             prev_scheduled_chunks_to_remove = scheduled_chunks_to_remove
             if remove_step_counter == steps_per_removed_chunk or steps_per_removed_chunk == 0:
                 scheduled_chunks_to_remove += 1
@@ -372,59 +436,86 @@ def main():
                     second_sep_pos = second_sep_positions[batch_id]
                     chunks_to_remove_this = chunks_to_remove[batch_id].item()
                     
-                    # Find punctuation positions in the reasoning section
-                    reasoning_start = first_sep_pos + 1
-                    reasoning_end = second_sep_pos
-                    punct_positions = find_punctuation_positions(
-                        input_ids[batch_id], punctuation_token_ids, 
-                        reasoning_start, reasoning_end
+                    # Debug output for first 3 examples of first batch
+                    if batch_counter <= 5 and batch_id < 3:
+                        # Show reasoning section before removal
+                        reasoning_tokens = input_ids[batch_id][first_sep_pos + 1:second_sep_pos]
+                        reasoning_text = tokenizer.decode(reasoning_tokens, skip_special_tokens=True)
+                        
+                        # Show chunks found and what will be removed
+                        chunks = chunk_text(reasoning_text, ['.', ',', ';', ':', '!', '?'])
+                        
+                        if len(chunks) > 0 and chunks_to_remove_this > 0:
+                            if args.removal_side == 'left':
+                                chunks_to_remove_actual = min(chunks_to_remove_this, len(chunks))
+                                removed_chunks = chunks[:chunks_to_remove_actual] if chunks_to_remove_actual > 0 else []
+                            else:
+                                chunks_to_remove_actual = min(chunks_to_remove_this, len(chunks))
+                                removed_chunks = chunks[-chunks_to_remove_actual:] if chunks_to_remove_actual > 0 else []
+                        else:
+                            removed_chunks = []
+                        
+                        print(f"\n--- Batch {batch_counter}, Example {batch_id + 1} ---")
+                        print(f"CURRENT: {reasoning_text}")
+                        if removed_chunks:
+                            print(f"REMOVING: {''.join(removed_chunks)}")
+                        else:
+                            print(f"REMOVING: (nothing)")
+                    
+                    # Use text-level chunking
+                    new_input_ids, new_labels = remove_chunks(
+                        input_ids[batch_id], labels[batch_id], tokenizer,
+                        first_sep_pos, second_sep_pos, eos_position,
+                        chunks_to_remove_this, args.removal_side
                     )
                     
-                    if len(punct_positions) == 0 or chunks_to_remove_this == 0:
-                        # No punctuation found or nothing to remove
-                        input_ids_tmp.append(input_ids[batch_id, :eos_position+1])
-                        labels_tmp.append(labels[batch_id, :eos_position+1])
-                        all_cot_removed_in_batch = False
-                        continue
-                    
-                    # Determine removal boundaries based on punctuation
-                    if args.removal_side == 'left':
-                        # Remove from beginning up to Nth punctuation mark
-                        chunks_to_remove_actual = min(chunks_to_remove_this, len(punct_positions))
-                        if chunks_to_remove_actual > 0:
-                            removal_from_position = reasoning_start
-                            removal_to_position = punct_positions[chunks_to_remove_actual - 1] + 1  # include punctuation
+                    # Continue debug output for first 3 examples of first batch
+                    if batch_counter <= 5 and batch_id < 3:
+                        new_first_sep = None
+                        new_second_sep = None
+                        sep_count = 0
+                        for i, token_id in enumerate(new_input_ids):
+                            if token_id == tokenizer.eos_token_id:
+                                if sep_count == 0:
+                                    new_first_sep = i
+                                elif sep_count == 1:
+                                    new_second_sep = i
+                                    break
+                                sep_count += 1
+                        
+                        if new_first_sep is not None and new_second_sep is not None:
+                            new_reasoning_tokens = new_input_ids[new_first_sep + 1:new_second_sep]
+                            new_reasoning_text = tokenizer.decode(new_reasoning_tokens, skip_special_tokens=True)
+                            print(f"REMAINING: {new_reasoning_text}")
                         else:
-                            removal_from_position = removal_to_position = reasoning_start
-                    else:  # removal_side == 'right'
-                        # Remove from Nth-to-last punctuation mark to end
-                        chunks_to_remove_actual = min(chunks_to_remove_this, len(punct_positions))
-                        if chunks_to_remove_actual > 0:
-                            removal_from_position = punct_positions[-(chunks_to_remove_actual)] if chunks_to_remove_actual <= len(punct_positions) else reasoning_start
-                            removal_to_position = reasoning_end
-                        else:
-                            removal_from_position = removal_to_position = reasoning_end
+                            print("REMAINING: (none)")
+                        print()
+
+                    # Check if we still have reasoning content after removal
+                    reasoning_start_new = first_sep_pos + 1
+                    reasoning_end_new = None
+                    # Find new second separator position
+                    for i in range(reasoning_start_new, len(new_input_ids)):
+                        if new_input_ids[i] == tokenizer.eos_token_id:
+                            reasoning_end_new = i
+                            break
                     
-                    # Check if we're removing everything
-                    if removal_to_position < reasoning_end:
+                    if reasoning_end_new is not None and reasoning_end_new > reasoning_start_new:
                         all_cot_removed_in_batch = False
                     
-                    # Ensure boundaries are within reasoning section
-                    removal_from_position = max(removal_from_position, reasoning_start)
-                    removal_to_position = min(removal_to_position, reasoning_end)
+                    input_ids_tmp.append(new_input_ids)
+                    labels_tmp.append(new_labels)
                     
                     if args.keep_position:
-                        position_ids[batch_id, removal_from_position-1:] += removal_to_position - removal_from_position
-                    
-                    # Create new sequence without removed tokens
-                    input_ids_tmp.append(torch.cat((
-                        input_ids[batch_id, :removal_from_position], 
-                        input_ids[batch_id, removal_to_position:eos_position+1]
-                    ), dim=-1))
-                    labels_tmp.append(torch.cat((
-                        labels[batch_id, :removal_from_position], 
-                        labels[batch_id, removal_to_position:eos_position+1]
-                    ), dim=-1))
+                        # Adjust position IDs for the shortened sequence
+                        original_length = input_ids.shape[-1]
+                        new_length = len(new_input_ids)
+                        length_diff = original_length - new_length
+                        if length_diff > 0:
+                            position_ids[batch_id, first_sep_pos:] = torch.arange(
+                                first_sep_pos, first_sep_pos + (original_length - first_sep_pos) - length_diff,
+                                dtype=torch.long, device=device
+                            )
                 
                 input_ids = batch_ids(input_ids_tmp, tokenizer.eos_token_id, device, input_ids.dtype)
                 labels = batch_ids(labels_tmp, -100, device, input_ids.dtype)
